@@ -117,9 +117,20 @@ export interface ChatMessage {
   timestamp: string;
 }
 
+export interface RoomPlayer {
+  id: string;
+  name: string;
+  avatar: string;
+  team: Team;
+  isHost?: boolean;
+  isBot?: boolean;
+  botDifficulty?: 'easy' | 'medium' | 'hard';
+}
+
 export interface Room {
   id: string;
   name: string;
+  hostId?: string;
   hostName: string;
   stadiumId: string;
   maxPlayers: number;
@@ -128,4 +139,9 @@ export interface Room {
   isPrivate?: boolean;
   password?: string;
   playerCount: number;
+  players?: RoomPlayer[];
+  status?: 'waiting' | 'playing' | 'closed';
+  lastActive?: number;
+  createdAt?: string;
 }
+

@@ -11,7 +11,7 @@ import {
   limit,
 } from 'firebase/firestore';
 import { db, auth } from './firebase';
-import { MatchStats, Room, Stadium, Team } from '../types/game';
+import { MatchStats, Room, RoomPlayer, Stadium, Team } from '../types/game';
 
 export enum OperationType {
   CREATE = 'create',
@@ -292,7 +292,7 @@ export async function getLeaderboardFromDatabase(maxCount: number = 10): Promise
 }
 
 /**
- * Creates or updates an active room in Firestore
+ * Creates an active room in Firestore with hostId, players list, and heartbeat timestamp
  */
 export async function createRoomInDatabase(room: Room): Promise<boolean> {
   const path = `rooms/${room.id}`;
@@ -300,6 +300,7 @@ export async function createRoomInDatabase(room: Room): Promise<boolean> {
     const dataToSave = {
       id: room.id,
       name: room.name.slice(0, 80),
+      hostId: room.hostId || '',
       hostName: room.hostName.slice(0, 50),
       stadiumId: room.stadiumId.slice(0, 50),
       scoreLimit: room.scoreLimit,
@@ -308,7 +309,10 @@ export async function createRoomInDatabase(room: Room): Promise<boolean> {
       playerCount: room.playerCount,
       isPrivate: Boolean(room.isPrivate),
       password: room.password ? room.password.slice(0, 50) : '',
-      createdAt: new Date().toISOString(),
+      status: room.status || 'waiting',
+      lastActive: Date.now(),
+      players: room.players || [],
+      createdAt: room.createdAt || new Date().toISOString(),
     };
     await setDoc(doc(db, 'rooms', room.id), dataToSave);
     return true;
@@ -324,7 +328,61 @@ export async function createRoomInDatabase(room: Room): Promise<boolean> {
 }
 
 /**
- * Deletes a room from Firestore (e.g., when match ends or host leaves)
+ * Updates room heartbeat so the room remains visible in the active rooms listing.
+ * Passing name and playerCount satisfies Firestore security rules.
+ */
+export async function updateRoomHeartbeat(
+  roomId: string,
+  name: string,
+  playerCount: number
+): Promise<void> {
+  const path = `rooms/${roomId}`;
+  try {
+    await setDoc(
+      doc(db, 'rooms', roomId),
+      {
+        name: name.slice(0, 80),
+        playerCount: Math.max(1, playerCount),
+        lastActive: Date.now(),
+      },
+      { merge: true }
+    );
+  } catch (error) {
+    // Non-fatal heartbeat warning
+    console.warn('Falha no heartbeat da sala:', error);
+  }
+}
+
+/**
+ * Updates players list and real-time settings for a room in Firestore
+ */
+export async function updateRoomPlayersInDatabase(
+  roomId: string,
+  name: string,
+  players: RoomPlayer[]
+): Promise<boolean> {
+  const path = `rooms/${roomId}`;
+  try {
+    const humanCount = players.filter((p) => !p.isBot).length;
+    await setDoc(
+      doc(db, 'rooms', roomId),
+      {
+        name: name.slice(0, 80),
+        playerCount: Math.max(1, humanCount),
+        players: players,
+        lastActive: Date.now(),
+      },
+      { merge: true }
+    );
+    return true;
+  } catch (error) {
+    console.warn('Erro ao atualizar jogadores da sala:', error);
+    return false;
+  }
+}
+
+/**
+ * Deletes a room from Firestore (e.g., when match ends, admin leaves, or browser closes)
  */
 export async function deleteRoomFromDatabase(roomId: string): Promise<boolean> {
   const path = `rooms/${roomId}`;
@@ -343,13 +401,47 @@ export async function deleteRoomFromDatabase(roomId: string): Promise<boolean> {
 }
 
 /**
- * Fetches all active rooms from Firestore
+ * Helper to check if a room is active based on heartbeat (within last 25 seconds)
+ */
+function isRoomActive(room: Room): boolean {
+  if (room.status === 'closed') return false;
+  const now = Date.now();
+  // If room has lastActive timestamp, must be active within 25 seconds
+  if (room.lastActive) {
+    return now - room.lastActive < 25000;
+  }
+  // If created recently (within last 20 seconds), treat as active
+  if (room.createdAt) {
+    const createdTime = new Date(room.createdAt).getTime();
+    if (!isNaN(createdTime) && now - createdTime < 20000) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Fetches all currently active rooms from Firestore, pruning abandoned ones
  */
 export async function getRoomsFromDatabase(): Promise<Room[]> {
   const path = 'rooms';
   try {
     const snapshot = await getDocs(collection(db, 'rooms'));
-    return snapshot.docs.map((d) => d.data() as Room);
+    const all = snapshot.docs.map((d) => d.data() as Room);
+    const active: Room[] = [];
+    const now = Date.now();
+
+    for (const r of all) {
+      if (isRoomActive(r)) {
+        active.push(r);
+      } else {
+        // Asynchronously delete stale room if it has been inactive for > 35s
+        if (r.lastActive && now - r.lastActive > 35000) {
+          deleteDoc(doc(db, 'rooms', r.id)).catch(() => {});
+        }
+      }
+    }
+    return active;
   } catch (error) {
     console.warn('Could not fetch rooms:', error);
     try {
@@ -369,7 +461,9 @@ export async function getRoomByIdFromDatabase(roomId: string): Promise<Room | nu
   try {
     const docSnap = await getDoc(doc(db, 'rooms', roomId));
     if (docSnap.exists()) {
-      return docSnap.data() as Room;
+      const data = docSnap.data() as Room;
+      if (data.status === 'closed') return null;
+      return data;
     }
     return null;
   } catch (error) {
@@ -384,7 +478,43 @@ export async function getRoomByIdFromDatabase(roomId: string): Promise<Room | nu
 }
 
 /**
- * Subscribes to real-time room changes from Firestore
+ * Subscribes to real-time updates for a specific room (players, status, settings)
+ */
+export function subscribeToRoomById(
+  roomId: string,
+  onUpdate: (room: Room | null) => void,
+  onError?: (err: Error) => void
+): () => void {
+  const path = `rooms/${roomId}`;
+  try {
+    const unsubscribe = onSnapshot(
+      doc(db, 'rooms', roomId),
+      (docSnap) => {
+        if (!docSnap.exists()) {
+          onUpdate(null);
+          return;
+        }
+        const data = docSnap.data() as Room;
+        if (data.status === 'closed') {
+          onUpdate(null);
+          return;
+        }
+        onUpdate(data);
+      },
+      (error) => {
+        console.warn('Room snapshot error:', error);
+        if (onError) onError(error);
+      }
+    );
+    return unsubscribe;
+  } catch (error) {
+    console.warn('Failed to listen to room:', error);
+    return () => {};
+  }
+}
+
+/**
+ * Subscribes to real-time active rooms from Firestore, filtering out closed or stale rooms
  */
 export function subscribeToRoomsInDatabase(
   onUpdate: (rooms: Room[]) => void,
@@ -395,8 +525,17 @@ export function subscribeToRoomsInDatabase(
     const unsubscribe = onSnapshot(
       collection(db, path),
       (snapshot) => {
-        const rooms = snapshot.docs.map((d) => d.data() as Room);
-        onUpdate(rooms);
+        const all = snapshot.docs.map((d) => d.data() as Room);
+        const activeRooms = all.filter(isRoomActive);
+        onUpdate(activeRooms);
+
+        // Periodically purge dead rooms in background
+        const now = Date.now();
+        all.forEach((r) => {
+          if (r.lastActive && now - r.lastActive > 40000) {
+            deleteDoc(doc(db, 'rooms', r.id)).catch(() => {});
+          }
+        });
       },
       (error) => {
         console.warn('Real-time rooms listener error:', error);
@@ -414,4 +553,5 @@ export function subscribeToRoomsInDatabase(
     return () => {};
   }
 }
+
 

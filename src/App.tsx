@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Trophy, Settings as SettingsIcon, Volume2, VolumeX, HelpCircle, Shield, Gamepad2, Database } from 'lucide-react';
-import { Ball, ChatMessage, Disc, MatchStats, MatchStatus, ReplayFrame, Room, Stadium, Team } from './types/game';
+import { Ball, ChatMessage, Disc, MatchStats, MatchStatus, ReplayFrame, Room, RoomPlayer, Stadium, Team } from './types/game';
 import { STADIUMS } from './physics/stadiums';
 import { buildStadiumGeometry, createInitialBall, resetDiscsPositions, stepPhysics } from './physics/engine';
 import { updateBotAI } from './physics/ai';
@@ -16,7 +16,11 @@ import {
   subscribeToRoomsInDatabase,
   getRoomsFromDatabase,
   getRoomByIdFromDatabase,
+  updateRoomHeartbeat,
+  updateRoomPlayersInDatabase,
+  subscribeToRoomById,
 } from './lib/firestoreService';
+
 import { GameCanvas } from './components/GameCanvas';
 import { Scoreboard } from './components/Scoreboard';
 import { RoomLobby } from './components/RoomLobby';
@@ -31,27 +35,42 @@ import { DatabaseModal } from './components/DatabaseModal';
 
 const DEFAULT_INITIAL_ROOM: Room = {
   id: 'room-main',
-  name: '⚽ Arena Principal 1v1',
-  hostName: 'Jogador',
+  name: '⚽ Arena Principal',
+  hostId: '',
+  hostName: '',
   stadiumId: 'classic',
-  maxPlayers: 2,
+  maxPlayers: 6,
   scoreLimit: 3,
   timeLimitMinutes: 3,
   playerCount: 1,
+  status: 'waiting',
 };
 
 export default function App() {
   // Navigation View: BROWSER, LOBBY, PLAYING, or EDITOR
   const [currentView, setCurrentView] = useState<'BROWSER' | 'LOBBY' | 'PLAYING' | 'EDITOR'>('BROWSER');
 
-  // Player Profile
-  const [playerName, setPlayerName] = useState<string>(() => {
-    return localStorage.getItem('haxball_player_name') || 'Jogador';
+  // Unique Player Profile & User ID
+  const [currentUserId] = useState<string>(() => {
+    let id = localStorage.getItem('haxball_user_id');
+    if (!id) {
+      id = `usr-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 7)}`;
+      localStorage.setItem('haxball_user_id', id);
+    }
+    return id;
   });
+
+  const [playerName, setPlayerName] = useState<string>(() => {
+    const saved = localStorage.getItem('haxball_player_name');
+    if (saved) return saved;
+    const initialName = `Jogador #${Math.floor(100 + Math.random() * 900)}`;
+    localStorage.setItem('haxball_player_name', initialName);
+    return initialName;
+  });
+
   const [playerAvatar, setPlayerAvatar] = useState<string>(() => {
     return localStorage.getItem('haxball_player_avatar') || '7';
   });
-  const currentUserId = 'player-user';
 
   // Custom Stadiums
   const [customStadiums, setCustomStadiums] = useState<Stadium[]>(() => {
@@ -85,6 +104,13 @@ export default function App() {
   const [showHelpModal, setShowHelpModal] = useState<boolean>(false);
   const [showDatabaseModal, setShowDatabaseModal] = useState<boolean>(false);
   const [isFirebaseConnected, setIsFirebaseConnected] = useState<boolean>(false);
+
+  // Computed: Only the creator of the room has Admin privileges
+  const isAdmin = Boolean(
+    currentRoom &&
+      ((currentRoom.hostId && currentRoom.hostId === currentUserId) ||
+        (!currentRoom.hostId && currentRoom.hostName === playerName))
+  );
 
   // Initialize Firebase connection and load cloud custom stadiums
   useEffect(() => {
@@ -124,12 +150,36 @@ export default function App() {
     const urlParams = new URLSearchParams(window.location.search);
     const roomParam = urlParams.get('room');
     if (roomParam) {
-      getRoomByIdFromDatabase(roomParam).then((foundRoom) => {
+      getRoomByIdFromDatabase(roomParam).then(async (foundRoom) => {
         if (foundRoom) {
           setCurrentRoom(foundRoom);
           setSelectedStadiumId(foundRoom.stadiumId);
           setScoreLimit(foundRoom.scoreLimit);
           setTimeLimit(foundRoom.timeLimitMinutes);
+
+          // Register user into room's players list if not already there
+          const existingPlayers = foundRoom.players || [];
+          const isHost = foundRoom.hostId === currentUserId;
+          const alreadyJoined = existingPlayers.some((p) => p.id === currentUserId);
+
+          if (!alreadyJoined) {
+            const redCount = existingPlayers.filter((p) => p.team === 'red').length;
+            const blueCount = existingPlayers.filter((p) => p.team === 'blue').length;
+            const assignTeam: Team =
+              blueCount < redCount ? 'blue' : redCount < blueCount ? 'red' : 'spectator';
+
+            const guestPlayer: RoomPlayer = {
+              id: currentUserId,
+              name: playerName,
+              avatar: playerAvatar,
+              team: assignTeam,
+              isHost,
+            };
+            const updated = [...existingPlayers, guestPlayer];
+            foundRoom.players = updated;
+            await updateRoomPlayersInDatabase(foundRoom.id, foundRoom.name, updated);
+          }
+
           setCurrentView('LOBBY');
           setChatMessages((prev) => [
             ...prev,
@@ -137,14 +187,131 @@ export default function App() {
               id: String(Date.now()),
               sender: 'Sistema',
               team: 'system',
-              text: `Entraste na sala através do link partilhado: "${foundRoom.name}".`,
+              text: `Entraste na sala "${foundRoom.name}" de ${foundRoom.hostName} com o jogador "${playerName}".`,
+              timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            },
+          ]);
+        } else {
+          // Room does not exist or was closed
+          try {
+            window.history.replaceState({}, '', window.location.pathname);
+          } catch {}
+          setChatMessages((prev) => [
+            ...prev,
+            {
+              id: String(Date.now()),
+              sender: 'Sistema',
+              team: 'system',
+              text: 'A sala indicada no link já não existe ou foi encerrada pelo anfitrião.',
               timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
             },
           ]);
         }
       });
     }
-  }, []);
+  }, [currentUserId, playerName, playerAvatar]);
+
+  // Heartbeat & automatic room deletion on tab close / window unload for Room Host
+  useEffect(() => {
+    if (!currentRoom?.id || currentRoom.id === 'room-main') return;
+    if (!isAdmin) return;
+
+    // 1. Regular heartbeat every 5 seconds so room stays active in listing
+    const interval = setInterval(() => {
+      updateRoomHeartbeat(currentRoom.id, currentRoom.name, currentRoom.playerCount || 1);
+    }, 5000);
+
+    // 2. On browser tab close or window unload: delete room immediately
+    const handleBeforeUnload = () => {
+      deleteRoomFromDatabase(currentRoom.id);
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    window.addEventListener('pagehide', handleBeforeUnload);
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.removeEventListener('pagehide', handleBeforeUnload);
+    };
+  }, [currentRoom?.id, currentRoom?.name, currentRoom?.playerCount, isAdmin]);
+
+  // Real-time synchronization of room lobby players and settings
+  useEffect(() => {
+    if (currentView !== 'LOBBY' || !currentRoom?.id || currentRoom.id === 'room-main') {
+      return;
+    }
+
+    const unsubscribe = subscribeToRoomById(currentRoom.id, (cloudRoom) => {
+      if (!cloudRoom) {
+        // Room was closed or deleted by host!
+        if (!isAdmin) {
+          try {
+            window.history.replaceState({}, '', window.location.pathname);
+          } catch {}
+          setCurrentView('BROWSER');
+          setChatMessages((prev) => [
+            ...prev,
+            {
+              id: String(Date.now()),
+              sender: 'Sistema',
+              team: 'system',
+              text: 'A sala foi encerrada pelo anfitrião.',
+              timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            },
+          ]);
+        }
+        return;
+      }
+
+      setCurrentRoom(cloudRoom);
+      if (cloudRoom.stadiumId) setSelectedStadiumId(cloudRoom.stadiumId);
+      if (cloudRoom.scoreLimit !== undefined) setScoreLimit(cloudRoom.scoreLimit);
+      if (cloudRoom.timeLimitMinutes !== undefined) setTimeLimit(cloudRoom.timeLimitMinutes);
+
+      if (cloudRoom.players && cloudRoom.players.length > 0) {
+        setDiscs((prevDiscs) => {
+          return cloudRoom.players!.map((p) => {
+            const existing = prevDiscs.find((d) => d.id === p.id);
+            const teamColor = p.team === 'red' ? '#ef4444' : p.team === 'blue' ? '#3b82f6' : '#64748b';
+            if (existing) {
+              return {
+                ...existing,
+                name: p.name,
+                avatar: p.avatar,
+                team: p.team,
+                color: teamColor,
+                isBot: Boolean(p.isBot),
+                botDifficulty: p.botDifficulty,
+              };
+            }
+            return {
+              id: p.id,
+              name: p.name,
+              avatar: p.avatar,
+              team: p.team,
+              x: p.team === 'red' ? 260 : p.team === 'blue' ? 580 : 420,
+              y: 200,
+              vx: 0,
+              vy: 0,
+              radius: 15,
+              invMass: 0.5,
+              damping: 0.96,
+              color: teamColor,
+              avatarColor: '#ffffff',
+              isKicking: false,
+              kickCooldown: 0,
+              isBot: Boolean(p.isBot),
+              botDifficulty: p.botDifficulty,
+            };
+          });
+        });
+      }
+    });
+
+    return () => unsubscribe();
+  }, [currentView, currentRoom?.id, isAdmin]);
+
 
   // Match State
   const [matchStatus, setMatchStatus] = useState<MatchStatus>('waiting');
@@ -758,10 +925,31 @@ export default function App() {
     }
   };
 
+  // Helper to synchronize lobby discs/players with Firestore
+  const syncDiscsToFirestore = useCallback(
+    (updatedDiscs: Disc[]) => {
+      if (!currentRoom?.id || currentRoom.id === 'room-main') return;
+      const roomPlayers: RoomPlayer[] = updatedDiscs.map((d) => ({
+        id: d.id,
+        name: d.name,
+        avatar: d.avatar,
+        team: d.team,
+        isBot: Boolean(d.isBot),
+        botDifficulty: d.botDifficulty,
+        isHost: Boolean(
+          (currentRoom.hostId && d.id === currentRoom.hostId) ||
+          (!currentRoom.hostId && d.name === currentRoom.hostName)
+        ),
+      }));
+      updateRoomPlayersInDatabase(currentRoom.id, currentRoom.name, roomPlayers);
+    },
+    [currentRoom?.id, currentRoom?.name, currentRoom?.hostId, currentRoom?.hostName]
+  );
+
   // Team Management Handlers
   const handleJoinTeam = (team: Team) => {
-    setDiscs((prev) =>
-      prev.map((d) => {
+    setDiscs((prev) => {
+      const next = prev.map((d) => {
         if (d.id === currentUserId) {
           return {
             ...d,
@@ -770,8 +958,10 @@ export default function App() {
           };
         }
         return d;
-      })
-    );
+      });
+      syncDiscsToFirestore(next);
+      return next;
+    });
   };
 
   const handleAddBot = (team: 'red' | 'blue') => {
@@ -779,7 +969,7 @@ export default function App() {
     const names = ['Bruno', 'Cristiano', 'Rafa', 'Bernardo', 'Rúben', 'Diogo', 'Félix'];
     const botName = `Bot ${names[botCount % names.length]}`;
     const newBot: Disc = {
-      id: `bot-${Date.now()}`,
+      id: `bot-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
       name: botName,
       avatar: String(botCount + 2),
       team,
@@ -797,17 +987,25 @@ export default function App() {
       isBot: true,
       botDifficulty,
     };
-    setDiscs((prev) => [...prev, newBot]);
+    setDiscs((prev) => {
+      const next = [...prev, newBot];
+      syncDiscsToFirestore(next);
+      return next;
+    });
   };
 
   const handleRemoveBot = (discId: string) => {
-    setDiscs((prev) => prev.filter((d) => d.id !== discId));
+    setDiscs((prev) => {
+      const next = prev.filter((d) => d.id !== discId);
+      syncDiscsToFirestore(next);
+      return next;
+    });
   };
 
   // Admin Move Player Handler (Drag & Drop or Direct Assign)
   const handleMovePlayer = (playerId: string, targetTeam: Team) => {
-    setDiscs((prev) =>
-      prev.map((d) => {
+    setDiscs((prev) => {
+      const next = prev.map((d) => {
         if (d.id === playerId) {
           return {
             ...d,
@@ -816,8 +1014,10 @@ export default function App() {
           };
         }
         return d;
-      })
-    );
+      });
+      syncDiscsToFirestore(next);
+      return next;
+    });
 
     const movedDisc = discs.find((d) => d.id === playerId);
     if (movedDisc) {
@@ -1045,11 +1245,33 @@ export default function App() {
             rooms={rooms}
             stadiumsList={allStadiumsList}
             onOpenStadiumEditor={() => setCurrentView('EDITOR')}
-            onJoinRoom={(room) => {
+            onJoinRoom={async (room) => {
               setCurrentRoom(room);
               setSelectedStadiumId(room.stadiumId);
               setScoreLimit(room.scoreLimit);
               setTimeLimit(room.timeLimitMinutes);
+
+              // Register player into room players in database if not already there
+              const existingPlayers = room.players || [];
+              const isHost = room.hostId ? room.hostId === currentUserId : room.hostName === playerName;
+              const alreadyIn = existingPlayers.some((p) => p.id === currentUserId);
+              if (!alreadyIn) {
+                const redCount = existingPlayers.filter((p) => p.team === 'red').length;
+                const blueCount = existingPlayers.filter((p) => p.team === 'blue').length;
+                const assignTeam: Team =
+                  blueCount < redCount ? 'blue' : redCount < blueCount ? 'red' : 'spectator';
+                const guestPlayer: RoomPlayer = {
+                  id: currentUserId,
+                  name: playerName,
+                  avatar: playerAvatar,
+                  team: assignTeam,
+                  isHost,
+                };
+                const updated = [...existingPlayers, guestPlayer];
+                room.players = updated;
+                await updateRoomPlayersInDatabase(room.id, room.name, updated);
+              }
+
               setCurrentView('LOBBY');
               try {
                 window.history.replaceState(
@@ -1060,9 +1282,18 @@ export default function App() {
               } catch {}
             }}
             onCreateRoom={async (data) => {
+              const newRoomId = `room-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+              const hostPlayer: RoomPlayer = {
+                id: currentUserId,
+                name: playerName,
+                avatar: playerAvatar,
+                team: 'red',
+                isHost: true,
+              };
               const newRoom: Room = {
-                id: `room-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+                id: newRoomId,
                 name: data.name,
+                hostId: currentUserId,
                 hostName: playerName,
                 stadiumId: data.stadiumId,
                 scoreLimit: data.scoreLimit,
@@ -1071,7 +1302,30 @@ export default function App() {
                 password: data.password,
                 isPrivate: Boolean(data.password),
                 playerCount: 1,
+                status: 'waiting',
+                players: [hostPlayer],
+                lastActive: Date.now(),
+                createdAt: new Date().toISOString(),
               };
+              setDiscs([
+                {
+                  id: currentUserId,
+                  name: playerName,
+                  avatar: playerAvatar,
+                  team: 'red',
+                  x: 260,
+                  y: 200,
+                  vx: 0,
+                  vy: 0,
+                  radius: 15,
+                  invMass: 0.5,
+                  damping: 0.96,
+                  color: '#ef4444',
+                  avatarColor: '#ffffff',
+                  isKicking: false,
+                  kickCooldown: 0,
+                },
+              ]);
               setRooms((prev) => [newRoom, ...prev.filter((r) => r.id !== newRoom.id)]);
               setCurrentRoom(newRoom);
               setSelectedStadiumId(data.stadiumId);
@@ -1105,7 +1359,7 @@ export default function App() {
             room={currentRoom}
             currentUserId={currentUserId}
             playerName={playerName}
-            isAdmin={currentRoom.hostName === playerName}
+            isAdmin={isAdmin}
             discs={discs}
             selectedStadiumId={selectedStadiumId}
             stadiumsList={allStadiumsList}
@@ -1114,7 +1368,12 @@ export default function App() {
             scoreLimit={scoreLimit}
             isLocalTwoPlayer={isLocalTwoPlayer}
             botDifficulty={botDifficulty}
-            onSelectStadium={setSelectedStadiumId}
+            onSelectStadium={(stadiumId) => {
+              setSelectedStadiumId(stadiumId);
+              if (isAdmin && currentRoom.id && currentRoom.id !== 'room-main') {
+                updateRoomPlayersInDatabase(currentRoom.id, currentRoom.name, currentRoom.players || []);
+              }
+            }}
             onSelectTimeLimit={setTimeLimit}
             onSelectScoreLimit={setScoreLimit}
             onToggleLocalTwoPlayer={(enabled) => {
@@ -1164,8 +1423,11 @@ export default function App() {
               try {
                 window.history.replaceState({}, '', window.location.pathname);
               } catch {}
-              if (currentRoom.hostName === playerName) {
+              if (isAdmin) {
                 await deleteRoomFromDatabase(currentRoom.id);
+              } else if (currentRoom.id && currentRoom.id !== 'room-main') {
+                const remaining = (currentRoom.players || []).filter((p) => p.id !== currentUserId);
+                await updateRoomPlayersInDatabase(currentRoom.id, currentRoom.name, remaining);
               }
               setCurrentView('BROWSER');
             }}
@@ -1274,6 +1536,16 @@ export default function App() {
             setPlayerAvatar(newAvatar);
             localStorage.setItem('haxball_player_name', newName);
             localStorage.setItem('haxball_player_avatar', newAvatar);
+            setDiscs((prev) => {
+              const updated = prev.map((d) => {
+                if (d.id === currentUserId) {
+                  return { ...d, name: newName, avatar: newAvatar };
+                }
+                return d;
+              });
+              syncDiscsToFirestore(updated);
+              return updated;
+            });
           }}
           onToggleMute={() => {
             const muted = sounds.toggleMute();

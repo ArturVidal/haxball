@@ -77,7 +77,9 @@ export const RoomLobby: React.FC<RoomLobbyProps> = ({
   const [draggedPlayerId, setDraggedPlayerId] = useState<string | null>(null);
   const [dragOverTeam, setDragOverTeam] = useState<Team | null>(null);
 
-  const isAdmin = propIsAdmin ?? (room.hostName === playerName);
+  const isAdmin =
+    propIsAdmin ??
+    Boolean(room.hostId ? room.hostId === currentUserId : room.hostName === playerName);
 
   const redPlayers = discs.filter((d) => d.team === 'red');
   const bluePlayers = discs.filter((d) => d.team === 'blue');
