@@ -1,0 +1,81 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Default deny all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Connection test document
+    match /test/connection {
+      allow read: if true;
+    }
+
+    // Match Records Collection
+    match /matches/{matchId} {
+      allow read: if true;
+      allow create: if isValidId(matchId)
+        && incoming().roomName is string && incoming().roomName.size() <= 80
+        && incoming().stadiumName is string && incoming().stadiumName.size() <= 80
+        && incoming().redScore is number
+        && incoming().blueScore is number
+        && incoming().winnerTeam in ['red', 'blue', 'draw']
+        && incoming().durationSeconds is number;
+      allow update, delete: if false;
+    }
+
+    // Custom Stadiums Collection
+    match /stadiums/{stadiumId} {
+      allow read: if true;
+      allow create: if isValidId(stadiumId)
+        && incoming().name is string && incoming().name.size() <= 60
+        && incoming().width is number && incoming().width >= 500 && incoming().width <= 1400
+        && incoming().height is number && incoming().height >= 250 && incoming().height <= 800;
+      allow update: if isValidId(stadiumId)
+        && incoming().name is string && incoming().name.size() <= 60;
+      allow delete: if false;
+    }
+
+    // Player Leaderboard / Stats Collection
+    match /leaderboard/{playerId} {
+      allow read: if true;
+      allow create, update: if isValidId(playerId)
+        && incoming().playerName is string && incoming().playerName.size() <= 40
+        && incoming().matchesPlayed is number
+        && incoming().wins is number
+        && incoming().goalsScored is number;
+      allow delete: if false;
+    }
+
+    // Active Game Rooms Collection
+    match /rooms/{roomId} {
+      allow read: if true;
+      allow create: if isValidId(roomId)
+        && incoming().name is string && incoming().name.size() <= 80
+        && incoming().hostName is string && incoming().hostName.size() <= 50
+        && incoming().stadiumId is string && incoming().stadiumId.size() <= 50
+        && incoming().scoreLimit is number
+        && incoming().timeLimitMinutes is number
+        && incoming().maxPlayers is number
+        && incoming().playerCount is number;
+      allow update: if isValidId(roomId)
+        && incoming().name is string && incoming().name.size() <= 80
+        && incoming().playerCount is number;
+      allow delete: if isValidId(roomId);
+    }
+  }
+}

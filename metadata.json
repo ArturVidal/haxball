@@ -1,0 +1,6 @@
+{
+  "name": "HaxBall Web Arena",
+  "description": "Recriação completa e fluida do clássico jogo de futebol 2D HaxBall com física autêntica, bots com IA inteligente, modos 1v1, 2v2 e 3v3, multiplayer local e salas, replays e múltiplos estádios.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,96 @@
+{
+  "entities": {
+    "MatchRecord": {
+      "title": "MatchRecord",
+      "description": "Historical record of completed matches played in HaxBall Arena.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "roomName": { "type": "string", "maxLength": 80 },
+        "stadiumName": { "type": "string", "maxLength": 80 },
+        "stadiumId": { "type": "string", "maxLength": 50 },
+        "redScore": { "type": "number" },
+        "blueScore": { "type": "number" },
+        "winnerTeam": { "type": "string", "enum": ["red", "blue", "draw"] },
+        "durationSeconds": { "type": "number" },
+        "redPossessionPercent": { "type": "number" },
+        "bluePossessionPercent": { "type": "number" },
+        "totalShots": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "playedBy": { "type": "string", "maxLength": 50 }
+      },
+      "required": ["roomName", "stadiumName", "redScore", "blueScore", "winnerTeam", "durationSeconds", "createdAt"]
+    },
+    "CustomStadium": {
+      "title": "CustomStadium",
+      "description": "User created custom stadium layout saved in the cloud database.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string", "maxLength": 60 },
+        "description": { "type": "string", "maxLength": 200 },
+        "width": { "type": "number" },
+        "height": { "type": "number" },
+        "goalWidth": { "type": "number" },
+        "goalDepth": { "type": "number" },
+        "goalOffsetY": { "type": "number" },
+        "pitchColor": { "type": "string", "maxLength": 30 },
+        "authorName": { "type": "string", "maxLength": 50 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "width", "height", "goalWidth", "goalDepth", "pitchColor", "createdAt"]
+    },
+    "PlayerStats": {
+      "title": "PlayerStats",
+      "description": "Aggregate statistics for a player nickname.",
+      "type": "object",
+      "properties": {
+        "playerName": { "type": "string", "maxLength": 40 },
+        "matchesPlayed": { "type": "number" },
+        "wins": { "type": "number" },
+        "losses": { "type": "number" },
+        "draws": { "type": "number" },
+        "goalsScored": { "type": "number" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["playerName", "matchesPlayed", "wins", "goalsScored"]
+    },
+    "GameRoom": {
+      "title": "GameRoom",
+      "description": "Active game room created by a host player.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string", "maxLength": 80 },
+        "hostName": { "type": "string", "maxLength": 50 },
+        "stadiumId": { "type": "string", "maxLength": 50 },
+        "scoreLimit": { "type": "number" },
+        "timeLimitMinutes": { "type": "number" },
+        "maxPlayers": { "type": "number" },
+        "playerCount": { "type": "number" },
+        "isPrivate": { "type": "boolean" },
+        "password": { "type": "string", "maxLength": 50 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "hostName", "stadiumId", "scoreLimit", "timeLimitMinutes", "maxPlayers", "playerCount"]
+    }
+  },
+  "firestore": {
+    "/matches/{matchId}": {
+      "schema": { "$ref": "#/entities/MatchRecord" },
+      "description": "Collection of recorded HaxBall matches with scores, stats and duration."
+    },
+    "/stadiums/{stadiumId}": {
+      "schema": { "$ref": "#/entities/CustomStadium" },
+      "description": "Community and user created stadiums saved to the cloud."
+    },
+    "/leaderboard/{playerId}": {
+      "schema": { "$ref": "#/entities/PlayerStats" },
+      "description": "Player rank and aggregate match performance stats."
+    },
+    "/rooms/{roomId}": {
+      "schema": { "$ref": "#/entities/GameRoom" },
+      "description": "Active multiplayer game rooms created by users in the Firestore database."
+    }
+  }
+}
