@@ -18,8 +18,11 @@ import {
   getRoomByIdFromDatabase,
   updateRoomHeartbeat,
   updateRoomPlayersInDatabase,
+  updateRoomStatusInDatabase,
   subscribeToRoomById,
 } from './lib/firestoreService';
+import { initHostP2P, initGuestP2P } from './lib/p2pNetwork';
+
 
 import { GameCanvas } from './components/GameCanvas';
 import { Scoreboard } from './components/Scoreboard';
@@ -211,108 +214,6 @@ export default function App() {
     }
   }, [currentUserId, playerName, playerAvatar]);
 
-  // Heartbeat & automatic room deletion on tab close / window unload for Room Host
-  useEffect(() => {
-    if (!currentRoom?.id || currentRoom.id === 'room-main') return;
-    if (!isAdmin) return;
-
-    // 1. Regular heartbeat every 5 seconds so room stays active in listing
-    const interval = setInterval(() => {
-      updateRoomHeartbeat(currentRoom.id, currentRoom.name, currentRoom.playerCount || 1);
-    }, 5000);
-
-    // 2. On browser tab close or window unload: delete room immediately
-    const handleBeforeUnload = () => {
-      deleteRoomFromDatabase(currentRoom.id);
-    };
-
-    window.addEventListener('beforeunload', handleBeforeUnload);
-    window.addEventListener('pagehide', handleBeforeUnload);
-
-    return () => {
-      clearInterval(interval);
-      window.removeEventListener('beforeunload', handleBeforeUnload);
-      window.removeEventListener('pagehide', handleBeforeUnload);
-    };
-  }, [currentRoom?.id, currentRoom?.name, currentRoom?.playerCount, isAdmin]);
-
-  // Real-time synchronization of room lobby players and settings
-  useEffect(() => {
-    if (currentView !== 'LOBBY' || !currentRoom?.id || currentRoom.id === 'room-main') {
-      return;
-    }
-
-    const unsubscribe = subscribeToRoomById(currentRoom.id, (cloudRoom) => {
-      if (!cloudRoom) {
-        // Room was closed or deleted by host!
-        if (!isAdmin) {
-          try {
-            window.history.replaceState({}, '', window.location.pathname);
-          } catch {}
-          setCurrentView('BROWSER');
-          setChatMessages((prev) => [
-            ...prev,
-            {
-              id: String(Date.now()),
-              sender: 'Sistema',
-              team: 'system',
-              text: 'A sala foi encerrada pelo anfitrião.',
-              timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-            },
-          ]);
-        }
-        return;
-      }
-
-      setCurrentRoom(cloudRoom);
-      if (cloudRoom.stadiumId) setSelectedStadiumId(cloudRoom.stadiumId);
-      if (cloudRoom.scoreLimit !== undefined) setScoreLimit(cloudRoom.scoreLimit);
-      if (cloudRoom.timeLimitMinutes !== undefined) setTimeLimit(cloudRoom.timeLimitMinutes);
-
-      if (cloudRoom.players && cloudRoom.players.length > 0) {
-        setDiscs((prevDiscs) => {
-          return cloudRoom.players!.map((p) => {
-            const existing = prevDiscs.find((d) => d.id === p.id);
-            const teamColor = p.team === 'red' ? '#ef4444' : p.team === 'blue' ? '#3b82f6' : '#64748b';
-            if (existing) {
-              return {
-                ...existing,
-                name: p.name,
-                avatar: p.avatar,
-                team: p.team,
-                color: teamColor,
-                isBot: Boolean(p.isBot),
-                botDifficulty: p.botDifficulty,
-              };
-            }
-            return {
-              id: p.id,
-              name: p.name,
-              avatar: p.avatar,
-              team: p.team,
-              x: p.team === 'red' ? 260 : p.team === 'blue' ? 580 : 420,
-              y: 200,
-              vx: 0,
-              vy: 0,
-              radius: 15,
-              invMass: 0.5,
-              damping: 0.96,
-              color: teamColor,
-              avatarColor: '#ffffff',
-              isKicking: false,
-              kickCooldown: 0,
-              isBot: Boolean(p.isBot),
-              botDifficulty: p.botDifficulty,
-            };
-          });
-        });
-      }
-    });
-
-    return () => unsubscribe();
-  }, [currentView, currentRoom?.id, isAdmin]);
-
-
   // Match State
   const [matchStatus, setMatchStatus] = useState<MatchStatus>('waiting');
   const [redScore, setRedScore] = useState<number>(0);
@@ -397,7 +298,7 @@ export default function App() {
   const [replayPlaying, setReplayPlaying] = useState<boolean>(true);
   const [replaySpeed, setReplaySpeed] = useState<number>(0.5);
 
-  // Keyboard Inputs
+  // Keyboard & Touch Inputs
   const keysDownRef = useRef<Set<string>>(new Set());
   const touchDirectionRef = useRef<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
   const touchKickRef = useRef<boolean>(false);
@@ -420,48 +321,12 @@ export default function App() {
   timeSecondsRef.current = timeSeconds;
   const isGoalLockedRef = useRef<boolean>(false);
 
-  // Sync player profile with disc
-  useEffect(() => {
-    setDiscs((prev) =>
-      prev.map((d) =>
-        d.id === currentUserId ? { ...d, name: playerName, avatar: playerAvatar } : d
-      )
-    );
-  }, [playerName, playerAvatar]);
+  // WebRTC P2P Multiplayer References
+  const hostP2PRef = useRef<ReturnType<typeof initHostP2P> | null>(null);
+  const guestP2PRef = useRef<ReturnType<typeof initGuestP2P> | null>(null);
+  const guestInputsRef = useRef<Map<string, { dx: number; dy: number; isKicking: boolean }>>(new Map());
 
-  // Keyboard Event Listeners
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // Avoid capturing input if user is typing in a form or chat input
-      if (
-        e.target instanceof HTMLInputElement ||
-        e.target instanceof HTMLTextAreaElement ||
-        e.target instanceof HTMLSelectElement
-      ) {
-        return;
-      }
-
-      keysDownRef.current.add(e.code);
-
-      // Prevent scrolling on space / arrows during active match
-      if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) {
-        e.preventDefault();
-      }
-    };
-
-    const handleKeyUp = (e: KeyboardEvent) => {
-      keysDownRef.current.delete(e.code);
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
-    };
-  }, []);
-
-  // Countdown Sequence: Guarantees ball is strictly positioned at the center of the stadium
+  // Countdown Sequence: Centers ball and positions players
   const startCountdown = useCallback(() => {
     isGoalLockedRef.current = true;
     const currentStadium = stadiumsMap[selectedStadiumId] || STADIUMS.classic;
@@ -531,7 +396,257 @@ export default function App() {
     [startCountdown]
   );
 
-  // Match Start Trigger
+  // Sync player profile with disc
+  useEffect(() => {
+    setDiscs((prev) =>
+      prev.map((d) =>
+        d.id === currentUserId ? { ...d, name: playerName, avatar: playerAvatar } : d
+      )
+    );
+  }, [playerName, playerAvatar, currentUserId]);
+
+  // Keyboard Event Listeners
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement ||
+        e.target instanceof HTMLSelectElement
+      ) {
+        return;
+      }
+      keysDownRef.current.add(e.code);
+      if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) {
+        e.preventDefault();
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      keysDownRef.current.delete(e.code);
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, []);
+
+  // Heartbeat & automatic room deletion on tab close / window unload for Room Host
+  useEffect(() => {
+    if (!currentRoom?.id || currentRoom.id === 'room-main') return;
+    if (!isAdmin) return;
+
+    // 1. Regular heartbeat every 5 seconds so room stays active in listing
+    const interval = setInterval(() => {
+      updateRoomHeartbeat(currentRoom.id, currentRoom.name, currentRoom.playerCount || 1);
+    }, 5000);
+
+    // 2. On browser tab close or window unload: delete room immediately
+    const handleBeforeUnload = () => {
+      deleteRoomFromDatabase(currentRoom.id);
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    window.addEventListener('pagehide', handleBeforeUnload);
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.removeEventListener('pagehide', handleBeforeUnload);
+    };
+  }, [currentRoom?.id, currentRoom?.name, currentRoom?.playerCount, isAdmin]);
+
+  // WebRTC P2P Multiplayer Networking Lifecycle
+  useEffect(() => {
+    if (!currentRoom?.id || currentRoom.id === 'room-main') return;
+
+    if (isAdmin) {
+      // Host side: listens for guest signals and receives their inputs
+      const hostP2P = initHostP2P(currentRoom.id, {
+        onGuestInput: (input) => {
+          guestInputsRef.current.set(input.playerId, {
+            dx: input.dx,
+            dy: input.dy,
+            isKicking: input.isKicking,
+          });
+        },
+        onGuestConnected: () => {
+          setChatMessages((prev) => [
+            ...prev,
+            {
+              id: String(Date.now()),
+              sender: 'Sistema',
+              team: 'system',
+              text: 'Ligação P2P em tempo real estabelecida com sucesso!',
+              timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            },
+          ]);
+        },
+      });
+      hostP2PRef.current = hostP2P;
+      return () => {
+        hostP2P.cleanup();
+        hostP2PRef.current = null;
+      };
+    } else {
+      // Guest side: sends inputs to host and updates game state
+      const guestP2P = initGuestP2P(currentRoom.id, currentUserId, {
+        onStateUpdate: (state) => {
+          ballRef.current = { ...ballRef.current, ...state.ball };
+          setBall((prev) => ({ ...prev, ...state.ball }));
+
+          setDiscs((prev) =>
+            prev.map((d) => {
+              const remote = state.discs.find((rd) => rd.id === d.id);
+              if (remote) {
+                return {
+                  ...d,
+                  x: remote.x,
+                  y: remote.y,
+                  vx: remote.vx,
+                  vy: remote.vy,
+                  isKicking: remote.isKicking,
+                };
+              }
+              return d;
+            })
+          );
+
+          redScoreRef.current = state.redScore;
+          setRedScore(state.redScore);
+          blueScoreRef.current = state.blueScore;
+          setBlueScore(state.blueScore);
+          timeSecondsRef.current = state.timeSeconds;
+          setTimeSeconds(state.timeSeconds);
+          if (state.matchStatus && state.matchStatus !== matchStatusRef.current) {
+            matchStatusRef.current = state.matchStatus as MatchStatus;
+            setMatchStatus(state.matchStatus as MatchStatus);
+          }
+          setCountdownNumber(state.countdownNumber);
+          if (state.lastGoalScorer !== undefined) {
+            setLastGoalScorer(state.lastGoalScorer as any);
+          }
+        },
+        onStartMatch: () => {
+          isGoalLockedRef.current = true;
+          setCurrentView('PLAYING');
+          setRedScore(0);
+          redScoreRef.current = 0;
+          setBlueScore(0);
+          blueScoreRef.current = 0;
+          setTimeSeconds(0);
+          timeSecondsRef.current = 0;
+          startCountdown();
+        },
+        onReturnToLobby: () => {
+          setCurrentView('LOBBY');
+          setMatchStatus('waiting');
+        },
+      });
+      guestP2PRef.current = guestP2P;
+      return () => {
+        guestP2P.cleanup();
+        guestP2PRef.current = null;
+      };
+    }
+  }, [currentRoom?.id, isAdmin, currentUserId, startCountdown]);
+
+  // Real-time synchronization of room lobby players, settings, and match status
+  useEffect(() => {
+    if (!currentRoom?.id || currentRoom.id === 'room-main') {
+      return;
+    }
+
+    const unsubscribe = subscribeToRoomById(currentRoom.id, (cloudRoom) => {
+      if (!cloudRoom) {
+        // Room was closed or deleted by host!
+        if (!isAdmin) {
+          try {
+            window.history.replaceState({}, '', window.location.pathname);
+          } catch {}
+          setCurrentView('BROWSER');
+          setChatMessages((prev) => [
+            ...prev,
+            {
+              id: String(Date.now()),
+              sender: 'Sistema',
+              team: 'system',
+              text: 'A sala foi encerrada pelo anfitrião.',
+              timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            },
+          ]);
+        }
+        return;
+      }
+
+      setCurrentRoom(cloudRoom);
+      if (cloudRoom.stadiumId) setSelectedStadiumId(cloudRoom.stadiumId);
+      if (cloudRoom.scoreLimit !== undefined) setScoreLimit(cloudRoom.scoreLimit);
+      if (cloudRoom.timeLimitMinutes !== undefined) setTimeLimit(cloudRoom.timeLimitMinutes);
+
+      // Trigger match start for guest when host starts match (guaranteed fallback over database)
+      if (cloudRoom.status === 'playing' && currentView === 'LOBBY' && !isAdmin) {
+        isGoalLockedRef.current = true;
+        setCurrentView('PLAYING');
+        setRedScore(0);
+        redScoreRef.current = 0;
+        setBlueScore(0);
+        blueScoreRef.current = 0;
+        setTimeSeconds(0);
+        timeSecondsRef.current = 0;
+        startCountdown();
+      } else if (cloudRoom.status === 'waiting' && currentView === 'PLAYING' && !isAdmin) {
+        setCurrentView('LOBBY');
+        setMatchStatus('waiting');
+      }
+
+      if (cloudRoom.players && cloudRoom.players.length > 0) {
+        setDiscs((prevDiscs) => {
+          return cloudRoom.players!.map((p) => {
+            const existing = prevDiscs.find((d) => d.id === p.id);
+            const teamColor = p.team === 'red' ? '#ef4444' : p.team === 'blue' ? '#3b82f6' : '#64748b';
+            if (existing) {
+              return {
+                ...existing,
+                name: p.name,
+                avatar: p.avatar,
+                team: p.team,
+                color: teamColor,
+                isBot: Boolean(p.isBot),
+                botDifficulty: p.botDifficulty,
+              };
+            }
+            return {
+              id: p.id,
+              name: p.name,
+              avatar: p.avatar,
+              team: p.team,
+              x: p.team === 'red' ? 260 : p.team === 'blue' ? 580 : 420,
+              y: 200,
+              vx: 0,
+              vy: 0,
+              radius: 15,
+              invMass: 0.5,
+              damping: 0.96,
+              color: teamColor,
+              avatarColor: '#ffffff',
+              isKicking: false,
+              kickCooldown: 0,
+              isBot: Boolean(p.isBot),
+              botDifficulty: p.botDifficulty,
+            };
+          });
+        });
+      }
+    });
+
+    return () => unsubscribe();
+  }, [currentView, currentRoom?.id, isAdmin, startCountdown]);
+
+
+  // Match Start Trigger: Starts local match and notifies remote guests over WebRTC and Firestore
   const handleStartMatch = () => {
     isGoalLockedRef.current = true;
     setCurrentView('PLAYING');
@@ -560,8 +675,36 @@ export default function App() {
       goals: [],
     };
     replayBufferRef.current = [];
+
+    // Notify connected guests over WebRTC and Firestore database so match starts on all devices
+    if (isAdmin && currentRoom?.id && currentRoom.id !== 'room-main') {
+      hostP2PRef.current?.broadcastMessage({ type: 'START_MATCH' });
+      updateRoomStatusInDatabase(
+        currentRoom.id,
+        currentRoom.name,
+        'playing',
+        currentRoom.playerCount || 1
+      );
+    }
+
     startCountdown();
   };
+
+  // Exit Match to Lobby Trigger
+  const handleExitToLobby = () => {
+    if (isAdmin && currentRoom?.id && currentRoom.id !== 'room-main') {
+      hostP2PRef.current?.broadcastMessage({ type: 'RETURN_TO_LOBBY' });
+      updateRoomStatusInDatabase(
+        currentRoom.id,
+        currentRoom.name,
+        'waiting',
+        currentRoom.playerCount || 1
+      );
+    }
+    setCurrentView('LOBBY');
+    setMatchStatus('waiting');
+  };
+
 
   // Replay frame playback loop
   useEffect(() => {
@@ -657,6 +800,11 @@ export default function App() {
             disc.vx += dx * 0.11;
             disc.vy += dy * 0.11;
             disc.isKicking = isKicking;
+
+            // If playing as guest in an online match, stream input to host over WebRTC
+            if (!isAdmin && guestP2PRef.current) {
+              guestP2PRef.current.sendInput(dx, dy, isKicking);
+            }
           }
 
           // Player 2 (Local Multiplayer Mode - Blue team control via Arrows & Enter)
@@ -685,6 +833,16 @@ export default function App() {
             disc.isKicking = isKicking;
           }
 
+          // Remote Online Human Player (inputs streamed via P2P WebRTC to Host)
+          else if (!isLocalTwoPlayer && !disc.isBot) {
+            const remoteInput = guestInputsRef.current.get(disc.id);
+            if (remoteInput) {
+              disc.vx += remoteInput.dx * 0.11;
+              disc.vy += remoteInput.dy * 0.11;
+              disc.isKicking = remoteInput.isKicking;
+            }
+          }
+
           // Bot AI
           else if (disc.isBot) {
             updateBotAI(disc, currentDiscs, currentBall, currentStadium, geo, isCountdown);
@@ -702,7 +860,34 @@ export default function App() {
           isGoalLockedRef.current
         );
 
-        // 3. Record frame in rolling replay buffer (last ~240 frames = 4 seconds)
+        // 3. Broadcast authoritative state from Host to connected guests over WebRTC
+        if (isAdmin && hostP2PRef.current) {
+          hostP2PRef.current.broadcastState({
+            type: 'STATE',
+            ball: {
+              x: currentBall.x,
+              y: currentBall.y,
+              vx: currentBall.vx,
+              vy: currentBall.vy,
+            },
+            discs: currentDiscs.map((d) => ({
+              id: d.id,
+              x: d.x,
+              y: d.y,
+              vx: d.vx,
+              vy: d.vy,
+              isKicking: d.isKicking,
+            })),
+            redScore: redScoreRef.current,
+            blueScore: blueScoreRef.current,
+            timeSeconds: timeSecondsRef.current,
+            matchStatus: matchStatusRef.current,
+            countdownNumber,
+            lastGoalScorer,
+          });
+        }
+
+        // 4. Record frame in rolling replay buffer (last ~240 frames = 4 seconds)
         replayBufferRef.current.push({
           ball: {
             x: currentBall.x,
@@ -710,6 +895,7 @@ export default function App() {
             vx: currentBall.vx,
             vy: currentBall.vy,
           },
+
           players: currentDiscs.map((d) => ({
             id: d.id,
             x: d.x,
@@ -1465,8 +1651,9 @@ export default function App() {
                 setMatchStatus((prev) => (prev === 'playing' ? 'waiting' : 'playing'));
               }}
               onRestartMatch={handleStartMatch}
-              onExitToLobby={() => setCurrentView('LOBBY')}
+              onExitToLobby={handleExitToLobby}
             />
+
 
             {/* Replay Controls (if active) */}
             {isWatchingReplay && savedReplay && (
@@ -1515,7 +1702,7 @@ export default function App() {
           blueScore={blueScore}
           stats={matchStats}
           onRestart={handleStartMatch}
-          onBackToLobby={() => setCurrentView('LOBBY')}
+          onBackToLobby={handleExitToLobby}
           hasReplayFrames={Boolean(savedReplay && savedReplay.length > 0)}
           onWatchLastReplay={() => {
             setIsWatchingReplay(true);

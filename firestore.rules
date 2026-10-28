@@ -76,6 +76,12 @@ service cloud.firestore {
         && incoming().name is string && incoming().name.size() <= 80
         && incoming().playerCount is number;
       allow delete: if isValidId(roomId);
+
+      // WebRTC Real-Time Signaling for multiplayer P2P connection
+      match /signals/{signalId} {
+        allow read, write, delete: if isValidId(roomId) && isValidId(signalId);
+      }
     }
   }
 }
+

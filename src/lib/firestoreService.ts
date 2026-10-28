@@ -354,6 +354,35 @@ export async function updateRoomHeartbeat(
 }
 
 /**
+ * Updates room status ('waiting' | 'playing' | 'closed') in Firestore
+ */
+export async function updateRoomStatusInDatabase(
+  roomId: string,
+  name: string,
+  status: 'waiting' | 'playing' | 'closed',
+  playerCount: number
+): Promise<boolean> {
+  const path = `rooms/${roomId}`;
+  try {
+    await setDoc(
+      doc(db, 'rooms', roomId),
+      {
+        name: name.slice(0, 80),
+        status,
+        playerCount: Math.max(1, playerCount),
+        lastActive: Date.now(),
+      },
+      { merge: true }
+    );
+    return true;
+  } catch (error) {
+    console.warn('Erro ao atualizar status da sala:', error);
+    return false;
+  }
+}
+
+
+/**
  * Updates players list and real-time settings for a room in Firestore
  */
 export async function updateRoomPlayersInDatabase(
